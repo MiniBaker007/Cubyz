@@ -1,14 +1,142 @@
 const std = @import("std");
 
 const main = @import("main");
-const utils = main.utils;
 
 const c = @cImport({
 	@cDefine("_BITS_STDIO2_H", ""); // TODO: Zig fails to include this header file
 	@cInclude("miniaudio.h");
-	@cDefine("STB_VORBIS_HEADER_ONLY", "");
-	@cInclude("stb/stb_vorbis.h");
 });
+
+const File = struct {
+	file: std.fs.File,
+};
+
+fn getFile(handle: c.ma_vfs_file) !*File {
+	if(handle == null) return error.NullHandle;
+	return @as(*File, @ptrCast(@alignCast(handle.?)));
+}
+
+fn vfsOnOpen(pVfs: ?*c.ma_vfs, pFilePath: [*c]const u8, openMode: c.ma_uint32, pFile: ?*c.ma_vfs_file) callconv(.c) c.ma_result {
+	_ = pVfs;
+	if(openMode != c.MA_OPEN_MODE_READ) {
+		return c.MA_INVALID_ARGS;
+	}
+	if(pFile == null) {
+		return c.MA_INVALID_ARGS;
+	}
+
+	const path = std.mem.sliceTo(pFilePath, 0);
+
+	const vfsHandle = main.globalAllocator.create(File);
+
+	vfsHandle.file = main.files.cwd().openFile(path) catch {
+		main.globalAllocator.destroy(vfsHandle);
+		return c.MA_DOES_NOT_EXIST;
+	};
+
+	pFile.?.* = vfsHandle;
+
+	return c.MA_SUCCESS;
+}
+
+fn vfsOnClose(pVfs: ?*c.ma_vfs, pFile: c.ma_vfs_file) callconv(.c) c.ma_result {
+	_ = pVfs;
+	const vfsHandle = getFile(pFile) catch return c.MA_INVALID_ARGS;
+
+	vfsHandle.file.close();
+	main.globalAllocator.destroy(vfsHandle);
+	return c.MA_SUCCESS;
+}
+
+fn vfsOnRead(pVfs: ?*c.ma_vfs, pFile: c.ma_vfs_file, pBuffer: ?*anyopaque, bytesToRead: usize, pBytesRead: ?*usize) callconv(.c) c.ma_result {
+	_ = pVfs;
+	const vfsHandle = getFile(pFile) catch return c.MA_INVALID_ARGS;
+	if(pBuffer == null) return c.MA_INVALID_ARGS;
+
+	const buffer = @as([*]u8, @ptrCast(@alignCast(pBuffer.?)))[0..bytesToRead];
+
+	const bytesRead = vfsHandle.file.read(buffer) catch |err| {
+		if(err == error.EndOfStream) {
+			return c.MA_AT_END;
+		} else {
+			return c.MA_ERROR;
+		}
+	};
+
+	if(pBytesRead) |p| p.* = bytesRead;
+
+	if(bytesRead < bytesToRead) {
+		return c.MA_AT_END;
+	}
+
+	return c.MA_SUCCESS;
+}
+
+fn vfsOnSeek(pVfs: ?*c.ma_vfs, pFile: c.ma_vfs_file, offset: c.ma_int64, origin: c.ma_seek_origin) callconv(.c) c.ma_result {
+	_ = pVfs;
+	const vfsHandle = getFile(pFile) catch return c.MA_INVALID_ARGS;
+
+	switch(origin) {
+		c.ma_seek_origin_start => vfsHandle.file.seekTo(@intCast(offset)) catch return c.MA_ERROR,
+		c.ma_seek_origin_current => vfsHandle.file.seekBy(offset) catch return c.MA_ERROR,
+		c.ma_seek_origin_end => vfsHandle.file.seekFromEnd(offset) catch return c.MA_ERROR,
+		else => return c.MA_INVALID_ARGS,
+	}
+	return c.MA_SUCCESS;
+}
+
+fn vfsOnTell(pVfs: ?*c.ma_vfs, pFile: c.ma_vfs_file, pCursor: ?*c.ma_int64) callconv(.c) c.ma_result {
+	_ = pVfs;
+	if(pCursor == null) return c.MA_INVALID_ARGS;
+
+	const vfsHandle = getFile(pFile) catch return c.MA_INVALID_ARGS;
+
+	const pos = vfsHandle.file.getPos() catch return c.MA_ERROR;
+	pCursor.?.* = @intCast(pos);
+	return c.MA_SUCCESS;
+}
+
+fn vfsOnInfo(pVfs: ?*c.ma_vfs, pFile: c.ma_vfs_file, pInfo: ?*c.ma_file_info) callconv(.c) c.ma_result {
+	_ = pVfs;
+	if(pInfo == null) return c.MA_INVALID_ARGS;
+
+	const vfsHandle = getFile(pFile) catch return c.MA_INVALID_ARGS;
+
+	const size = vfsHandle.file.getEndPos() catch return c.MA_ERROR;
+	pInfo.?.*.sizeInBytes = size;
+
+	return c.MA_SUCCESS;
+}
+
+var vfs: c.ma_vfs_callbacks = .{
+	.onOpen = vfsOnOpen,
+	.onOpenW = null,
+	.onClose = vfsOnClose,
+	.onRead = vfsOnRead,
+	.onWrite = null,
+	.onSeek = vfsOnSeek,
+	.onTell = vfsOnTell,
+	.onInfo = vfsOnInfo,
+};
+
+fn onLog(pUserData: ?*anyopaque, logLevel: c.ma_uint32, pMessage: [*c]const u8) callconv(.c) void {
+	_ = pUserData;
+	const message = std.mem.sliceTo(pMessage, 0);
+
+	switch(logLevel) {
+		c.MA_LOG_LEVEL_DEBUG => std.log.debug("miniaudio: {s}", .{message}),
+		c.MA_LOG_LEVEL_INFO => std.log.info("miniaudio: {s}", .{message}),
+		c.MA_LOG_LEVEL_WARNING => std.log.warn("miniaudio: {s}", .{message}),
+		c.MA_LOG_LEVEL_ERROR => std.log.err("miniaudio: {s}", .{message}),
+		else => std.log.info("miniaudio: {s}", .{message}),
+	}
+}
+
+var engine: c.ma_engine = undefined;
+var resourceManager: c.ma_resource_manager = undefined;
+var log: c.ma_log = undefined;
+
+var mutex: std.Thread.Mutex = .{};
 
 fn handleError(miniaudioError: c.ma_result) !void {
 	if(miniaudioError != c.MA_SUCCESS) {
@@ -17,302 +145,117 @@ fn handleError(miniaudioError: c.ma_result) !void {
 	}
 }
 
-const AudioData = struct {
-	musicId: []const u8,
-	data: []f32 = &.{},
+pub fn init() !void {
+	try handleError(c.ma_log_init(null, &log));
+	const callback = c.ma_log_callback_init(onLog, null);
+	try handleError(c.ma_log_register_callback(&log, callback));
 
-	fn open_vorbis_file_by_id(id: []const u8) ?*c.stb_vorbis {
-		const colonIndex = std.mem.indexOfScalar(u8, id, ':') orelse {
-			std.log.err("Invalid music id: {s}. Must be addon:file_name", .{id});
-			return null;
-		};
-		const addon = id[0..colonIndex];
-		const fileName = id[colonIndex + 1 ..];
-		const path1 = std.fmt.allocPrintSentinel(main.stackAllocator.allocator, "assets/{s}/music/{s}.ogg", .{addon, fileName}, 0) catch unreachable;
-		defer main.stackAllocator.free(path1);
-		var err: c_int = 0;
-		if(c.stb_vorbis_open_filename(path1.ptr, &err, null)) |ogg_stream| return ogg_stream;
-		const path2 = std.fmt.allocPrintSentinel(main.stackAllocator.allocator, "{s}/serverAssets/{s}/music/{s}.ogg", .{main.files.cubyzDirStr(), addon, fileName}, 0) catch unreachable;
-		defer main.stackAllocator.free(path2);
-		if(c.stb_vorbis_open_filename(path2.ptr, &err, null)) |ogg_stream| return ogg_stream;
-		std.log.err("Couldn't find music with id \"{s}\". Searched path \"{s}\" and \"{s}\"", .{id, path1, path2});
-		return null;
-	}
+	var resourceManagerConfig = c.ma_resource_manager_config_init();
+	resourceManagerConfig.pLog = &log;
+	resourceManagerConfig.pVFS = &vfs;
+	try handleError(c.ma_resource_manager_init(&resourceManagerConfig, &resourceManager));
 
-	fn init(musicId: []const u8) *AudioData {
-		const self = main.globalAllocator.create(AudioData);
-		self.* = .{.musicId = main.globalAllocator.dupe(u8, musicId)};
-
-		const channels = 2;
-		if(open_vorbis_file_by_id(musicId)) |ogg_stream| {
-			defer c.stb_vorbis_close(ogg_stream);
-			const ogg_info: c.stb_vorbis_info = c.stb_vorbis_get_info(ogg_stream);
-			const samples = c.stb_vorbis_stream_length_in_samples(ogg_stream);
-			if(sampleRate != @as(f32, @floatFromInt(ogg_info.sample_rate))) {
-				const tempData = main.stackAllocator.alloc(f32, samples*channels);
-				defer main.stackAllocator.free(tempData);
-				_ = c.stb_vorbis_get_samples_float_interleaved(ogg_stream, channels, tempData.ptr, @as(c_int, @intCast(samples))*ogg_info.channels);
-				var stepWidth = @as(f32, @floatFromInt(ogg_info.sample_rate))/sampleRate;
-				const newSamples: usize = @intFromFloat(@as(f32, @floatFromInt(tempData.len/2))/stepWidth);
-				stepWidth = @as(f32, @floatFromInt(samples))/@as(f32, @floatFromInt(newSamples));
-				self.data = main.globalAllocator.alloc(f32, newSamples*channels);
-				for(0..newSamples) |s| {
-					const samplePosition = @as(f32, @floatFromInt(s))*stepWidth;
-					const firstSample: usize = @intFromFloat(@floor(samplePosition));
-					const interpolation = samplePosition - @floor(samplePosition);
-					for(0..channels) |ch| {
-						if(firstSample >= samples - 1) {
-							self.data[s*channels + ch] = tempData[(samples - 1)*channels + ch];
-						} else {
-							self.data[s*channels + ch] = tempData[firstSample*channels + ch]*(1 - interpolation) + tempData[(firstSample + 1)*channels + ch]*interpolation;
-						}
-					}
-				}
-			} else {
-				self.data = main.globalAllocator.alloc(f32, samples*channels);
-				_ = c.stb_vorbis_get_samples_float_interleaved(ogg_stream, channels, self.data.ptr, @as(c_int, @intCast(samples))*ogg_info.channels);
-			}
-		} else {
-			self.data = main.globalAllocator.alloc(f32, channels);
-			@memset(self.data, 0);
-		}
-		return self;
-	}
-
-	fn deinit(self: *const AudioData) void {
-		main.globalAllocator.free(self.data);
-		main.globalAllocator.free(self.musicId);
-		main.globalAllocator.destroy(self);
-	}
-
-	pub fn hashCode(self: *const AudioData) u32 {
-		var result: u32 = 0;
-		for(self.musicId) |char| {
-			result = result + char;
-		}
-		return result;
-	}
-
-	pub fn equals(self: *const AudioData, _other: ?*const AudioData) bool {
-		if(_other) |other| {
-			return std.mem.eql(u8, self.musicId, other.musicId);
-		} else return false;
-	}
-};
-
-var activeTasks: main.ListUnmanaged([]const u8) = .{};
-var taskMutex: std.Thread.Mutex = .{};
-
-var musicCache: utils.Cache(AudioData, 4, 4, AudioData.deinit) = .{};
-
-fn findMusic(musicId: []const u8) ?[]f32 {
-	{
-		taskMutex.lock();
-		defer taskMutex.unlock();
-		if(musicCache.find(AudioData{.musicId = musicId}, null)) |musicData| {
-			return musicData.data;
-		}
-		for(activeTasks.items) |taskFileName| {
-			if(std.mem.eql(u8, musicId, taskFileName)) {
-				return null;
-			}
-		}
-	}
-	MusicLoadTask.schedule(musicId);
-	return null;
-}
-
-const MusicLoadTask = struct {
-	musicId: []const u8,
-
-	const vtable = utils.ThreadPool.VTable{
-		.getPriority = main.meta.castFunctionSelfToAnyopaque(getPriority),
-		.isStillNeeded = main.meta.castFunctionSelfToAnyopaque(isStillNeeded),
-		.run = main.meta.castFunctionSelfToAnyopaque(run),
-		.clean = main.meta.castFunctionSelfToAnyopaque(clean),
-		.taskType = .misc,
-	};
-
-	pub fn schedule(musicId: []const u8) void {
-		const task = main.globalAllocator.create(MusicLoadTask);
-		task.* = MusicLoadTask{
-			.musicId = main.globalAllocator.dupe(u8, musicId),
-		};
-		main.threadPool.addTask(task, &vtable);
-		taskMutex.lock();
-		defer taskMutex.unlock();
-		activeTasks.append(main.globalAllocator, task.musicId);
-	}
-
-	pub fn getPriority(_: *MusicLoadTask) f32 {
-		return std.math.floatMax(f32);
-	}
-
-	pub fn isStillNeeded(_: *MusicLoadTask) bool {
-		return true;
-	}
-
-	pub fn run(self: *MusicLoadTask) void {
-		defer self.clean();
-		const data = AudioData.init(self.musicId);
-		const hasOld = musicCache.addToCache(data, data.hashCode());
-		if(hasOld) |old| {
-			old.deinit();
-		}
-	}
-
-	pub fn clean(self: *MusicLoadTask) void {
-		taskMutex.lock();
-		var index: usize = 0;
-		while(index < activeTasks.items.len) : (index += 1) {
-			if(activeTasks.items[index].ptr == self.musicId.ptr) break;
-		}
-		_ = activeTasks.swapRemove(index);
-		taskMutex.unlock();
-		main.globalAllocator.free(self.musicId);
-		main.globalAllocator.destroy(self);
-	}
-};
-
-// TODO: Proper sound and music system
-
-var device: c.ma_device = undefined;
-
-var sampleRate: f32 = 0;
-
-pub fn init() error{miniaudioError}!void {
-	var config = c.ma_device_config_init(c.ma_device_type_playback);
-	config.playback.format = c.ma_format_f32;
-	config.playback.channels = 2;
-	config.sampleRate = 44100;
-	config.dataCallback = &miniaudioCallback;
-	config.pUserData = undefined;
-
-	try handleError(c.ma_device_init(null, &config, &device));
-
-	try handleError(c.ma_device_start(&device));
-
-	sampleRate = 44100;
+	var engineConfig = c.ma_engine_config_init();
+	engineConfig.pLog = &log;
+	engineConfig.pResourceManager = &resourceManager;
+	try handleError(c.ma_engine_init(&engineConfig, &engine));
 }
 
 pub fn deinit() void {
-	handleError(c.ma_device_stop(&device)) catch {};
-	c.ma_device_uninit(&device);
 	mutex.lock();
 	defer mutex.unlock();
-	main.threadPool.closeAllTasksOfType(&MusicLoadTask.vtable);
-	musicCache.clear();
-	activeTasks.deinit(main.globalAllocator);
-	main.globalAllocator.free(preferredMusic);
-	preferredMusic.len = 0;
-	main.globalAllocator.free(activeMusicId);
-	activeMusicId.len = 0;
+
+	if(currentMusicId.len > 0) {
+		main.globalAllocator.free(currentMusicId);
+	}
+	currentMusicId = "";
+
+	if(music) |sound| {
+		c.ma_sound_uninit(sound);
+		main.globalAllocator.destroy(sound);
+		music = null;
+	}
+
+	c.ma_engine_uninit(&engine);
+	c.ma_resource_manager_uninit(&resourceManager);
+	c.ma_log_uninit(&log);
 }
 
-const currentMusic = struct {
-	var buffer: []const f32 = undefined;
-	var animationAmplitude: f32 = undefined;
-	var animationVelocity: f32 = undefined;
-	var animationDecaying: bool = undefined;
-	var animationProgress: f32 = undefined;
-	var interpolationPolynomial: [4]f32 = undefined;
-	var pos: u32 = undefined;
+pub fn setMasterVolume(volume: f32) void {
+	_ = c.ma_engine_set_volume(&engine, volume);
+}
 
-	fn init(musicBuffer: []const f32) void {
-		buffer = musicBuffer;
-		animationAmplitude = 0;
-		animationVelocity = 0;
-		animationDecaying = false;
-		animationProgress = 0;
-		interpolationPolynomial = utils.unitIntervalSpline(f32, animationAmplitude, animationVelocity, 1, 0);
-		pos = 0;
-	}
+var music: ?*c.ma_sound = null;
+var musicDataSource: ?*c.ma_resource_manager_data_source = null;
+var currentMusicId: []const u8 = "";
 
-	fn evaluatePolynomial() void {
-		const t = animationProgress;
-		const t2 = t*t;
-		const t3 = t2*t;
-		const a = interpolationPolynomial;
-		animationAmplitude = a[0] + a[1]*t + a[2]*t2 + a[3]*t3; // value
-		animationVelocity = a[1] + 2*a[2]*t + 3*a[3]*t2;
-	}
-};
-
-var activeMusicId: []const u8 = &.{};
-var partialFrame: f32 = 0;
-const animationLengthInSeconds = 5.0;
-
-var curIndex: u16 = 0;
-var curEndIndex: std.atomic.Value(u16) = .{.value = sampleRate/60 & ~@as(u16, 1)};
-
-var mutex: std.Thread.Mutex = .{};
-var preferredMusic: []const u8 = "";
-
-pub fn setMusic(music: []const u8) void {
+pub fn setMusic(musicId: []const u8) void {
 	mutex.lock();
 	defer mutex.unlock();
-	if(std.mem.eql(u8, music, preferredMusic)) return;
-	main.globalAllocator.free(preferredMusic);
-	preferredMusic = main.globalAllocator.dupe(u8, music);
-}
 
-fn addMusic(buffer: []f32) void {
-	mutex.lock();
-	defer mutex.unlock();
-	if(!std.mem.eql(u8, preferredMusic, activeMusicId)) {
-		if(activeMusicId.len == 0) {
-			if(findMusic(preferredMusic)) |musicBuffer| {
-				currentMusic.init(musicBuffer);
-				main.globalAllocator.free(activeMusicId);
-				activeMusicId = main.globalAllocator.dupe(u8, preferredMusic);
-			}
-		} else if(!currentMusic.animationDecaying) {
-			_ = findMusic(preferredMusic); // Start loading the next music into the cache ahead of time.
-			currentMusic.animationDecaying = true;
-			currentMusic.animationProgress = 0;
-			currentMusic.interpolationPolynomial = utils.unitIntervalSpline(f32, currentMusic.animationAmplitude, currentMusic.animationVelocity, 0, 0);
-		}
-	} else if(currentMusic.animationDecaying) { // We returned to the biome before the music faded away.
-		currentMusic.animationDecaying = false;
-		currentMusic.animationProgress = 0;
-		currentMusic.interpolationPolynomial = utils.unitIntervalSpline(f32, currentMusic.animationAmplitude, currentMusic.animationVelocity, 1, 0);
-	}
-	if(activeMusicId.len == 0) return;
+	if(std.mem.eql(u8, musicId, currentMusicId)) return;
+	if(musicId.len == 0) return;
 
-	// Copy the music to the buffer.
-	var i: usize = 0;
-	while(i < buffer.len) : (i += 2) {
-		currentMusic.animationProgress += 1.0/(animationLengthInSeconds*sampleRate);
-		var amplitude: f32 = main.settings.musicVolume;
-		if(currentMusic.animationProgress > 1) {
-			if(currentMusic.animationDecaying) {
-				main.globalAllocator.free(activeMusicId);
-				activeMusicId = &.{};
-				amplitude = 0;
-			}
-		} else {
-			currentMusic.evaluatePolynomial();
-			amplitude *= currentMusic.animationAmplitude;
-		}
-		buffer[i] += amplitude*currentMusic.buffer[currentMusic.pos];
-		buffer[i + 1] += amplitude*currentMusic.buffer[currentMusic.pos + 1];
-		currentMusic.pos += 2;
-		if(currentMusic.pos >= currentMusic.buffer.len) {
-			currentMusic.pos = 0;
+	const colonIndex = std.mem.indexOfScalar(u8, musicId, ':') orelse {
+		std.log.err("Invalid music id: {s}. Must be of the form 'addon:file_name'", .{musicId});
+		return;
+	};
+	const addon = musicId[0..colonIndex];
+	const fileName = musicId[colonIndex + 1 ..];
+
+	const newDataSource = main.globalAllocator.create(c.ma_resource_manager_data_source);
+
+	const path1 = std.fmt.allocPrintSentinel(main.stackAllocator.allocator, "assets/{s}/music/{s}.ogg", .{addon, fileName}, 0) catch unreachable;
+	defer main.stackAllocator.free(path1);
+
+	var result = c.ma_resource_manager_data_source_init(&resourceManager, path1, 0, null, newDataSource);
+	if(result != c.MA_SUCCESS) {
+		const path2 = std.fmt.allocPrintSentinel(main.stackAllocator.allocator, "{s}/serverAssets/{s}/music/{s}.ogg", .{main.files.cubyzDirStr(), addon, fileName}, 0) catch unreachable;
+		defer main.stackAllocator.free(path2);
+
+		result = c.ma_resource_manager_data_source_init(&resourceManager, path2, 0, null, newDataSource);
+		if(result != c.MA_SUCCESS) {
+			std.log.err("Failed to load music '{s}' via resource manager: {s}.", .{musicId, c.ma_result_description(result)});
+			main.globalAllocator.destroy(newDataSource);
+			return;
 		}
 	}
-}
 
-fn miniaudioCallback(
-	maDevice: ?*anyopaque,
-	output: ?*anyopaque,
-	input: ?*const anyopaque,
-	frameCount: u32,
-) callconv(.c) void {
-	_ = input;
-	_ = maDevice;
-	const valuesPerBuffer = 2*frameCount; // Stereo
-	const buffer = @as([*]f32, @ptrCast(@alignCast(output)))[0..valuesPerBuffer];
-	@memset(buffer, 0);
-	addMusic(buffer);
+	const newMusic = main.globalAllocator.create(c.ma_sound);
+	const flags = c.MA_SOUND_FLAG_STREAM | c.MA_SOUND_FLAG_NO_PITCH | c.MA_SOUND_FLAG_NO_SPATIALIZATION;
+	result = c.ma_sound_init_from_data_source(&engine, newDataSource, flags, null, newMusic);
+	if(result != c.MA_SUCCESS) {
+		std.log.err("Failed to init sound from data source for '{s}': {s}.", .{musicId, c.ma_result_description(result)});
+		_ = c.ma_resource_manager_data_source_uninit(newDataSource);
+		main.globalAllocator.destroy(newMusic);
+		main.globalAllocator.destroy(newDataSource);
+		return;
+	}
+
+	c.ma_sound_set_looping(newMusic, c.MA_TRUE);
+
+	if(c.ma_sound_start(newMusic) != c.MA_SUCCESS) {
+		std.log.err("Failed to start new sound '{s}'", .{musicId});
+		c.ma_sound_uninit(newMusic);
+		_ = c.ma_resource_manager_data_source_uninit(newDataSource);
+		main.globalAllocator.destroy(newMusic);
+		main.globalAllocator.destroy(newDataSource);
+		return;
+	}
+
+	if(music) |sound| {
+		c.ma_sound_uninit(sound);
+		main.globalAllocator.destroy(sound);
+	}
+	if(musicDataSource) |dataSource| {
+		_ = c.ma_resource_manager_data_source_uninit(dataSource);
+		main.globalAllocator.destroy(dataSource);
+	}
+	if(currentMusicId.len > 0) {
+		main.globalAllocator.free(currentMusicId);
+	}
+
+	music = newMusic;
+	musicDataSource = newDataSource;
+	currentMusicId = main.globalAllocator.dupe(u8, musicId);
 }
