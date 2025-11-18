@@ -26,14 +26,11 @@ fn vfsOnOpen(pVfs: ?*c.ma_vfs, pFilePath: [*c]const u8, openMode: c.ma_uint32, p
 	}
 
 	const path = std.mem.sliceTo(pFilePath, 0);
-
 	const vfsHandle = main.globalAllocator.create(File);
-
 	vfsHandle.file = main.files.cwd().openFile(path) catch {
 		main.globalAllocator.destroy(vfsHandle);
 		return c.MA_DOES_NOT_EXIST;
 	};
-
 	pFile.?.* = vfsHandle;
 
 	return c.MA_SUCCESS;
