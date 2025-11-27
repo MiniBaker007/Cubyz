@@ -827,7 +827,7 @@ fn _toggleFullscreen() void {
 		}
 	} else {
 		viewportYOffset = 0;
-		c.glfwSetWindowMonitor(window, null, oldX, oldY, oldWidth, oldHeight, c.GLFW_DONT_CARE);
 		c.glfwSetWindowAttrib(window, c.GLFW_DECORATED, c.GLFW_TRUE);
+		c.glfwSetWindowMonitor(window, null, oldX, oldY, oldWidth, oldHeight, c.GLFW_DONT_CARE);
 	}
 }
