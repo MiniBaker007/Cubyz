@@ -100,6 +100,8 @@ pub fn init() !void {
 	var engineConfig = c.ma_engine_config_init();
 	engineConfig.pLog = &log;
 	engineConfig.pResourceManager = &resourceManager;
+	engineConfig.channels = 2;
+	engineConfig.sampleRate = 44100;
 	try handleError(c.ma_engine_init(&engineConfig, &engine));
 
 	currentMusic = main.globalAllocator.create(Music);
