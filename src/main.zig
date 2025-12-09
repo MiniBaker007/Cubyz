@@ -644,6 +644,8 @@ pub fn clientMain() void { // MARK: clientMain()
 
 		file_monitor.handleEvents();
 
+		audio.update();
+
 		if(game.world != null) { // Update the game
 			game.update(deltaTime);
 		}
