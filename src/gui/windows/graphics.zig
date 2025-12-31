@@ -30,7 +30,7 @@ const leavesQualities = [_]u8{0, 1, 2, 3, 4};
 
 var needsUpdate = false;
 
-fn fullscreenModeCallback(_: usize) void {
+fn fullscreenModeCallback() void {
 	settings.windowedFullscreen = !settings.windowedFullscreen;
 	settings.save();
 	needsUpdate = true;
@@ -142,7 +142,7 @@ fn vulkanTestingWindowCallback(newValue: bool) void {
 
 pub fn onOpen() void {
 	const list = VerticalList.init(.{padding, 16 + padding}, 300, 16);
-	list.add(Button.initText(.{0, 0}, 128, if(settings.windowedFullscreen) "Fullscreen: Borderless" else "Fullscreen: Exclusive", .{.callback = &fullscreenModeCallback}));
+	list.add(Button.initText(.{0, 0}, 128, if(settings.windowedFullscreen) "Fullscreen: Borderless" else "Fullscreen: Exclusive", .init(fullscreenModeCallback)));
 	list.add(ContinuousSlider.init(.{0, 0}, 128, 10.0, 154.0, @floatFromInt(settings.fpsCap orelse 154), &fpsCapCallback, &fpsCapFormatter));
 	list.add(DiscreteSlider.init(.{0, 0}, 128, "#ffffffLOD1 Distance: ", "{} chunks", &renderDistances, @min(@max(settings.renderDistance, renderDistances[0]) - renderDistances[0], renderDistances.len - 1), &renderDistanceCallback));
 	if(main.game.world == null) {
